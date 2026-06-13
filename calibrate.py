@@ -1,46 +1,108 @@
 import json
-
 import cv2
 import numpy as np
 
-ARUCO_DICT    = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-ARUCO_PARAMS  = cv2.aruco.DetectorParameters()
-DETECTOR      = cv2.aruco.ArucoDetector(ARUCO_DICT, ARUCO_PARAMS)
+CHESSBOARD_SIZE = (8, 5)
+SQUARE_SIZE_MM  = 10.0
 
 
-class Calibrator:
+class Calibrate:
     def __init__(self):
-        self.detections = []  # list of detected corner arrays for future use
+        self._subpix_crit = (
+            cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001
+        )
+        objp = np.zeros((CHESSBOARD_SIZE[0] * CHESSBOARD_SIZE[1], 3), np.float32)
+        objp[:, :2] = (
+            np.mgrid[0:CHESSBOARD_SIZE[0], 0:CHESSBOARD_SIZE[1]]
+            .T.reshape(-1, 2)
+        )
+        objp *= SQUARE_SIZE_MM
+        self._objp = objp
 
-    def process_frame_bgr(self, bgr: np.ndarray):
+    def calibrate_from_video_bytes(self, video_bytes: bytes) -> dict:
         """
-        Detect ArUco tag. Returns (bgr, found, bbox_or_None)
-        bbox: {x, y, w, h} bounding box in pixel coords of the input frame
-        also returns corners: [[x,y], ...] of the 4 tag corners
+        Accepts raw video bytes, extracts frames, detects chessboard,
+        runs calibrateCamera, returns intrinsics dict.
         """
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        import tempfile, os
+        # write to temp file so VideoCapture can read it
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            f.write(video_bytes)
+            tmp_path = f.name
 
-        corners, ids, _ = DETECTOR.detectMarkers(gray)
+        try:
+            cap = cv2.VideoCapture(tmp_path)
+            if not cap.isOpened():
+                raise RuntimeError("Could not open video")
 
-        if ids is None or len(ids) == 0:
-            return bgr, False, None, None
+            objpoints = []
+            imgpoints = []
+            image_size = None
+            frame_idx  = 0
+            sampled    = 0
 
-        # use first detected marker
-        c      = corners[0].reshape(4, 2)
-        x1     = float(c[:, 0].min())
-        y1     = float(c[:, 1].min())
-        x2     = float(c[:, 0].max())
-        y2     = float(c[:, 1].max())
-        bbox   = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
-        pts    = c.tolist()  # [[x,y], [x,y], [x,y], [x,y]] TL TR BR BL
-        marker_id = int(ids[0][0])
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                frame_idx += 1
+                # sample every 5th frame to avoid near-duplicate captures
+                if frame_idx % 5 != 0:
+                    continue
 
-        self.detections.append({"corners": pts, "id": marker_id})
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                if image_size is None:
+                    image_size = (frame.shape[1], frame.shape[0])
 
-        return bgr, True, bbox, {"corners": pts, "id": marker_id}
+                small  = cv2.resize(gray, (0, 0), fx=0.5, fy=0.5)
+                found, corners = cv2.findChessboardCorners(
+                    small, CHESSBOARD_SIZE,
+                    cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE,
+                )
+                if found:
+                    cv2.cornerSubPix(small, corners, (5, 5), (-1, -1), self._subpix_crit)
+                    corners_full = corners * 2.0
+                    objpoints.append(self._objp.copy())
+                    imgpoints.append(corners_full)
+                    sampled += 1
 
-    def frame_count(self):
-        return len(self.detections)
+            cap.release()
+        finally:
+            os.unlink(tmp_path)
 
-    def reset(self):
-        self.detections = []
+        print(f"calibrate: {frame_idx} frames read, {sampled} valid chessboard captures")
+
+        if sampled < 5:
+            raise RuntimeError(
+                f"Not enough valid chessboard frames: {sampled}. "
+                "Move the board to more angles."
+            )
+
+        rms, K, D, _, _ = cv2.calibrateCamera(
+            objpoints, imgpoints, image_size, None, None,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-6),
+        )
+
+        result = {
+            "rms_reprojection_error": float(rms),
+            "camera_matrix": {
+                "fx": float(K[0, 0]), "fy": float(K[1, 1]),
+                "cx": float(K[0, 2]), "cy": float(K[1, 2]),
+            },
+            "camera_matrix_3x3": K.tolist(),
+            "dist_coeffs": {
+                "k1": float(D[0, 0]), "k2": float(D[0, 1]),
+                "p1": float(D[0, 2]), "p2": float(D[0, 3]),
+                "k3": float(D[0, 4]) if D.shape[1] > 4 else 0.0,
+            },
+            "dist_coeffs_array": D.flatten().tolist(),
+            "image_size": {"width": image_size[0], "height": image_size[1]},
+            "num_frames": sampled,
+        }
+
+        with open("intrinsics.json", "w") as f:
+            json.dump(result, f, indent=2)
+        np.savez("intrinsics.npz", camera_matrix=K, dist_coeffs=D)
+        print(f"saved intrinsics.json  RMS={rms:.4f}")
+
+        return result

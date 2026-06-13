@@ -8,7 +8,8 @@ import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from calibrate import Calibrator
+from renderer import Renderer
+from calibrate import Calibrate
 
 app = FastAPI()
 app.add_middleware(
@@ -18,8 +19,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-calibrator = Calibrator()
-executor   = ThreadPoolExecutor(max_workers=1)
+renderer  = Renderer()
+calibrate = Calibrate()
+executor  = ThreadPoolExecutor(max_workers=1)
+
+# ── global camera intrinsics — updated after calibration ──────────────────────
+CAM_INTRINSICS: dict | None = None
 
 
 def detect_sync(data: bytes):
@@ -29,7 +34,7 @@ def detect_sync(data: bytes):
         return False, None, None
 
     t0 = time.perf_counter()
-    _, found, bbox, marker = calibrator.process_frame_bgr(frame)
+    _, found, bbox, marker = renderer.process_frame_bgr(frame)
     ms = (time.perf_counter() - t0) * 1000
     print(
         f"{'FOUND id=' + str(marker['id']) if found else 'no tag'} | "
@@ -38,8 +43,13 @@ def detect_sync(data: bytes):
     return found, bbox, marker
 
 
+def calibrate_sync(video_bytes: bytes):
+    return calibrate.calibrate_from_video_bytes(video_bytes)
+
+
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
+    global CAM_INTRINSICS
     await websocket.accept()
     print("client connected")
 
@@ -49,40 +59,45 @@ async def ws_endpoint(websocket: WebSocket):
         while True:
             msg = await websocket.receive()
 
+            # ── binary: either a JPEG frame or a raw video blob ───────────────
             if "bytes" in msg and msg["bytes"]:
-                found, bbox, marker = await loop.run_in_executor(
-                    executor, detect_sync, msg["bytes"]
-                )
-                await websocket.send_text(json.dumps({
-                    "type":   "status",
-                    "found":  found,
-                    "bbox":   bbox,
-                    "marker": marker,
-                }))
+                data = msg["bytes"]
 
-            elif "text" in msg and msg["text"]:
-                cmd    = json.loads(msg["text"])
-                action = cmd.get("action")
+                # check 4-byte type tag prepended by frontend
+                msg_type = data[:4]
 
-                if action == "calibrate":
+                if msg_type == b"VID\x00":
+                    # full video blob for calibration
+                    video_bytes = data[4:]
+                    print(f"received video: {len(video_bytes)//1024}KB — calibrating…")
+
                     try:
                         result = await loop.run_in_executor(
-                            executor, calibrator.calibrate
+                            executor, calibrate_sync, video_bytes
                         )
+                        CAM_INTRINSICS = result
+                        renderer.update_intrinsics(result)
                         await websocket.send_text(json.dumps({
                             "type": "calibration_result",
                             "data": result,
                         }))
-                        print(f"calibrated — RMS: {result['rms_reprojection_error']:.4f}")
+                        print(f"calibration done RMS={result['rms_reprojection_error']:.4f}")
                     except RuntimeError as e:
                         await websocket.send_text(json.dumps({
                             "type": "error", "message": str(e),
                         }))
 
-                elif action == "reset":
-                    calibrator.reset()
-                    await websocket.send_text(json.dumps({"type": "reset"}))
-                    print("reset")
+                else:
+                    # regular JPEG frame for live AR detection
+                    found, bbox, marker = await loop.run_in_executor(
+                        executor, detect_sync, data
+                    )
+                    await websocket.send_text(json.dumps({
+                        "type":   "status",
+                        "found":  found,
+                        "bbox":   bbox,
+                        "marker": marker,
+                    }))
 
     except WebSocketDisconnect:
         print("client disconnected")
