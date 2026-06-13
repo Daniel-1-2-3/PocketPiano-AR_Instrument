@@ -1,268 +1,305 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
+import Webcam from "react-webcam";
 
-export default function CameraCalibration() {
-  const videoRef = useRef(null);
-  const canvasRef = useRef(null);
-  const streamRef = useRef(null);
+const WS_URL      = "ws://172.20.10.4:8000/ws";
+const SEND_WIDTH  = 320;
+const SEND_HEIGHT = 240;
+const JPEG_Q      = 0.6;
+const FRAME_BUFFER_SIZE = 30; // hold last N frames
+const BOARD_COLS  = 8;
+const BOARD_ROWS  = 5;
 
-  const [cvReady, setCvReady] = useState(false);
-  const [detected, setDetected] = useState(false);
-  const [captures, setCaptures] = useState(0);
-  const [cameraMatrix, setCameraMatrix] = useState(null);
-  const [distCoeffs, setDistCoeffs] = useState(null);
+export default function Calibrate() {
+  const webcamRef    = useRef(null);
+  const overlayRef   = useRef(null);
+  const offRef       = useRef(null);
+  const wsRef        = useRef(null);
+  const waitingRef   = useRef(false);
+  const sendTimeRef  = useRef(0);
+  const rafRef       = useRef(null);
+  const recordingRef = useRef(false);
+  const frameIdRef   = useRef(0);
+  // ring buffer: id → ImageData of that frame
+  const frameBufferRef = useRef(new Map());
 
-  // If board has 9 x 6 SQUARES, OpenCV sees 8 x 5 INNER CORNERS
-  const CHESSBOARD_COLS = 8;
-  const CHESSBOARD_ROWS = 5;
-  const SQUARE_SIZE_MM = 10;
-  const NUM_CAPTURES_NEEDED = 20;
+  const [connected,   setConnected]   = useState(false);
+  const [recording,   setRecording]   = useState(false);
+  const [calibrating, setCalibrating] = useState(false);
+  const [frames,      setFrames]      = useState(0);
+  const [ping,        setPing]        = useState(null);
 
-  const objectPointsRef = useRef([]);
-  const imagePointsRef = useRef([]);
-  const lastCornersRef = useRef(null);
-  const lastGraySizeRef = useRef(null);
-
+  // ── WebSocket ──────────────────────────────────────────────────────────────
   useEffect(() => {
-    const checkCv = setInterval(() => {
-      if (window.cv && window.cv.Mat) {
-        clearInterval(checkCv);
-        window.cv.onRuntimeInitialized = () => {
-          setCvReady(true);
-        };
+    let alive = true;
+    let retryTimer = null;
 
-        if (window.cv.getBuildInformation) {
-          setCvReady(true);
+    const connect = () => {
+      if (!alive) return;
+      const ws = new WebSocket(WS_URL);
+      ws.binaryType = "arraybuffer";
+
+      ws.onopen  = () => { if (alive) setConnected(true); };
+      ws.onerror = () => {};
+      ws.onclose = () => {
+        if (!alive) return;
+        setConnected(false);
+        retryTimer = setTimeout(connect, 1000);
+      };
+
+      ws.onmessage = (e) => {
+        const rtt = performance.now() - sendTimeRef.current;
+        setPing(Math.round(rtt));
+        waitingRef.current = false;
+
+        const msg = JSON.parse(e.data);
+
+        if (msg.type === "status") {
+          setFrames(msg.frames);
+
+          const canvas  = overlayRef.current;
+          if (!canvas) return;
+
+          // get the frame this response corresponds to
+          const buf     = frameBufferRef.current;
+          const stored  = buf.get(msg.frame_id);
+
+          const W = canvas.width  = SEND_WIDTH;
+          const H = canvas.height = SEND_HEIGHT;
+          const ctx = canvas.getContext("2d");
+          ctx.clearRect(0, 0, W, H);
+
+          // draw the original frame first
+          if (stored) {
+            ctx.putImageData(stored, 0, 0);
+            buf.delete(msg.frame_id);
+          }
+
+          // draw corners on top if found
+          if (msg.found && msg.corners) {
+            const pts = msg.corners;
+            ctx.strokeStyle = "#00ff50";
+            ctx.lineWidth   = 1.5;
+            // rows
+            for (let r = 0; r < BOARD_ROWS; r++) {
+              ctx.beginPath();
+              for (let c = 0; c < BOARD_COLS; c++) {
+                const [x, y] = pts[r * BOARD_COLS + c];
+                c === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+              }
+              ctx.stroke();
+            }
+            // cols
+            for (let c = 0; c < BOARD_COLS; c++) {
+              ctx.beginPath();
+              for (let r = 0; r < BOARD_ROWS; r++) {
+                const [x, y] = pts[r * BOARD_COLS + c];
+                r === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+              }
+              ctx.stroke();
+            }
+            // dots
+            ctx.fillStyle = "#00ff50";
+            for (const [x, y] of pts) {
+              ctx.beginPath();
+              ctx.arc(x, y, 2.5, 0, Math.PI * 2);
+              ctx.fill();
+            }
+          }
         }
-      }
-    }, 100);
 
-    return () => clearInterval(checkCv);
-  }, []);
+        if (msg.type === "calibration_result") {
+          const blob = new Blob([JSON.stringify(msg.data, null, 2)], { type: "application/json" });
+          const url  = URL.createObjectURL(blob);
+          const a    = document.createElement("a");
+          a.href = url; a.download = "intrinsics.json"; a.click();
+          URL.revokeObjectURL(url);
+          setCalibrating(false);
+          setFrames(0);
+        }
 
-  useEffect(() => {
-    async function startCamera() {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: true,
-        audio: false,
-      });
+        if (msg.type === "error") {
+          alert(msg.message);
+          setCalibrating(false);
+        }
 
-      streamRef.current = stream;
-      videoRef.current.srcObject = stream;
-      await videoRef.current.play();
-    }
+        if (msg.type === "reset") {
+          setFrames(0);
+          const canvas = overlayRef.current;
+          if (canvas) canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
+        }
+      };
 
-    startCamera();
+      wsRef.current = ws;
+    };
 
+    connect();
     return () => {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((track) => track.stop());
-      }
+      alive = false;
+      clearTimeout(retryTimer);
+      wsRef.current?.close();
     };
   }, []);
 
+  // ── send loop ──────────────────────────────────────────────────────────────
   useEffect(() => {
-    if (!cvReady) return;
+    const off    = document.createElement("canvas");
+    off.width    = SEND_WIDTH;
+    off.height   = SEND_HEIGHT;
+    offRef.current = off;
+    const offCtx = off.getContext("2d", { alpha: false });
 
-    const cv = window.cv;
-    let animationId;
+    const loop = () => {
+      rafRef.current = requestAnimationFrame(loop);
 
-    function processFrame() {
-      const video = videoRef.current;
-      const canvas = canvasRef.current;
+      const ws     = wsRef.current;
+      const webcam = webcamRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (!recordingRef.current) return;
+      if (waitingRef.current) return;
+      if (!webcam) return;
 
-      if (!video || !canvas || video.videoWidth === 0) {
-        animationId = requestAnimationFrame(processFrame);
-        return;
+      const video = webcam.video;
+      if (!video || video.readyState < 2) return;
+
+      offCtx.drawImage(video, 0, 0, SEND_WIDTH, SEND_HEIGHT);
+
+      // snapshot this frame's pixels before sending
+      const frameId  = frameIdRef.current++;
+      const imgData  = offCtx.getImageData(0, 0, SEND_WIDTH, SEND_HEIGHT);
+
+      // keep buffer bounded
+      const buf = frameBufferRef.current;
+      buf.set(frameId, imgData);
+      if (buf.size > FRAME_BUFFER_SIZE) {
+        const oldest = buf.keys().next().value;
+        buf.delete(oldest);
       }
 
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
+      off.toBlob((blob) => {
+        if (!blob) return;
+        blob.arrayBuffer().then((rawBuf) => {
+          if (ws.readyState !== WebSocket.OPEN) return;
 
-      const ctx = canvas.getContext("2d");
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          // prepend 4-byte frame_id header so server echoes it back
+          const header  = new ArrayBuffer(4);
+          new DataView(header).setUint32(0, frameId, false);
+          const payload = new Uint8Array(4 + rawBuf.byteLength);
+          payload.set(new Uint8Array(header), 0);
+          payload.set(new Uint8Array(rawBuf), 4);
 
-      const src = cv.imread(canvas);
-      const gray = new cv.Mat();
-
-      cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-
-      const patternSize = new cv.Size(CHESSBOARD_COLS, CHESSBOARD_ROWS);
-      const corners = new cv.Mat();
-
-      const found = cv.findChessboardCorners(gray, patternSize, corners);
-
-      setDetected(found);
-
-      if (found) {
-        const criteria = new cv.TermCriteria(
-          cv.TermCriteria_EPS + cv.TermCriteria_MAX_ITER,
-          30,
-          0.001
-        );
-
-        cv.cornerSubPix(
-          gray,
-          corners,
-          new cv.Size(11, 11),
-          new cv.Size(-1, -1),
-          criteria
-        );
-
-        cv.drawChessboardCorners(src, patternSize, corners, found);
-        cv.imshow(canvas, src);
-
-        if (lastCornersRef.current) {
-          lastCornersRef.current.delete();
-        }
-
-        lastCornersRef.current = corners.clone();
-        lastGraySizeRef.current = gray.size();
-      } else {
-        cv.imshow(canvas, src);
-      }
-
-      src.delete();
-      gray.delete();
-      corners.delete();
-
-      animationId = requestAnimationFrame(processFrame);
-    }
-
-    processFrame();
-
-    return () => {
-      cancelAnimationFrame(animationId);
+          sendTimeRef.current = performance.now();
+          waitingRef.current  = true;
+          ws.send(payload.buffer);
+        });
+      }, "image/jpeg", JPEG_Q);
     };
-  }, [cvReady]);
 
-  function createObjectPoints() {
-    const cv = window.cv;
+    rafRef.current = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, []);
 
-    const objp = new cv.Mat(
-      CHESSBOARD_COLS * CHESSBOARD_ROWS,
-      1,
-      cv.CV_32FC3
-    );
-
-    for (let row = 0; row < CHESSBOARD_ROWS; row++) {
-      for (let col = 0; col < CHESSBOARD_COLS; col++) {
-        const i = row * CHESSBOARD_COLS + col;
-
-        objp.data32F[i * 3] = col * SQUARE_SIZE_MM;
-        objp.data32F[i * 3 + 1] = row * SQUARE_SIZE_MM;
-        objp.data32F[i * 3 + 2] = 0;
-      }
+  const handleButton = useCallback(() => {
+    if (calibrating) return;
+    if (recording) {
+      recordingRef.current = false;
+      setRecording(false);
+      setCalibrating(true);
+      wsRef.current?.send(JSON.stringify({ action: "calibrate" }));
+    } else {
+      wsRef.current?.send(JSON.stringify({ action: "reset" }));
+      frameBufferRef.current.clear();
+      recordingRef.current = true;
+      setRecording(true);
     }
-
-    return objp;
-  }
-
-  function captureFrame() {
-    if (!detected || !lastCornersRef.current) {
-      alert("No chessboard detected.");
-      return;
-    }
-
-    const objp = createObjectPoints();
-    const corners = lastCornersRef.current.clone();
-
-    objectPointsRef.current.push(objp);
-    imagePointsRef.current.push(corners);
-
-    setCaptures(objectPointsRef.current.length);
-  }
-
-  function calibrateCamera() {
-    const cv = window.cv;
-
-    if (objectPointsRef.current.length < 10) {
-      alert("Need at least 10 good captures.");
-      return;
-    }
-
-    const objectPoints = new cv.MatVector();
-    const imagePoints = new cv.MatVector();
-
-    objectPointsRef.current.forEach((p) => objectPoints.push_back(p));
-    imagePointsRef.current.forEach((p) => imagePoints.push_back(p));
-
-    const cameraMat = new cv.Mat();
-    const distMat = new cv.Mat();
-    const rvecs = new cv.MatVector();
-    const tvecs = new cv.MatVector();
-
-    const imageSize = lastGraySizeRef.current;
-
-    const reprojectionError = cv.calibrateCamera(
-      objectPoints,
-      imagePoints,
-      imageSize,
-      cameraMat,
-      distMat,
-      rvecs,
-      tvecs
-    );
-
-    console.log("Reprojection error:", reprojectionError);
-    console.log("Camera Matrix:", cameraMat.data64F);
-    console.log("Distortion Coefficients:", distMat.data64F);
-
-    setCameraMatrix(Array.from(cameraMat.data64F));
-    setDistCoeffs(Array.from(distMat.data64F));
-
-    objectPoints.delete();
-    imagePoints.delete();
-    cameraMat.delete();
-    distMat.delete();
-    rvecs.delete();
-    tvecs.delete();
-  }
+  }, [recording, calibrating]);
 
   return (
-    <div>
-      <h2>Live Chessboard Camera Calibration</h2>
+    <div style={{ position: "fixed", inset: 0, background: "#000", overflow: "hidden" }}>
+      {/* live webcam — always full screen */}
+      <Webcam
+        ref={webcamRef}
+        audio={false}
+        videoConstraints={{ facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } }}
+        style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover" }}
+      />
 
-      {!cvReady && <p>Loading OpenCV.js...</p>}
-
-      <video ref={videoRef} style={{ display: "none" }} />
-
+      {/* overlay canvas — matched frame + corners drawn on it */}
       <canvas
-        ref={canvasRef}
+        ref={overlayRef}
         style={{
-          width: "640px",
-          maxWidth: "100%",
-          border: "1px solid black",
+          position: "absolute", inset: 0,
+          width: "100%", height: "100%",
+          objectFit: "cover",
+          pointerEvents: "none",
+          display: recording ? "block" : "none",
         }}
       />
 
-      <p>
-        Status:{" "}
-        <strong style={{ color: detected ? "green" : "red" }}>
-          {detected ? "Chessboard detected" : "No chessboard"}
-        </strong>
-      </p>
+      {/* calibrating label */}
+      {calibrating && (
+        <div style={{
+          position: "absolute", inset: 0,
+          display: "flex", alignItems: "center", justifyContent: "center",
+          pointerEvents: "none",
+        }}>
+          <span style={{
+            fontFamily: "monospace", fontSize: 18,
+            color: "rgba(255,255,255,0.9)",
+            background: "rgba(0,0,0,0.5)",
+            padding: "10px 24px", borderRadius: 999,
+          }}>
+            Calibrating…
+          </span>
+        </div>
+      )}
 
-      <p>
-        Captured: {captures}/{NUM_CAPTURES_NEEDED}
-      </p>
+      {/* top-left HUD */}
+      <div style={{
+        position: "absolute", top: 20, left: 20,
+        display: "flex", flexDirection: "column", gap: 4,
+        pointerEvents: "none",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <div style={{
+            width: 7, height: 7, borderRadius: "50%",
+            background: connected ? "#4ade80" : "#f87171",
+          }} />
+          <span style={pill}>{connected ? `${ping ?? "–"}ms` : "offline"}</span>
+        </div>
+        {recording && frames > 0 && (
+          <span style={pill}>{frames} frames</span>
+        )}
+      </div>
 
-      <button onClick={captureFrame} disabled={!detected}>
-        Capture Frame
-      </button>
-
-      <button onClick={calibrateCamera} disabled={captures < 10}>
-        Calibrate
-      </button>
-
-      {cameraMatrix && (
-        <div>
-          <h3>Camera Matrix</h3>
-          <pre>{JSON.stringify(cameraMatrix, null, 2)}</pre>
-
-          <h3>Distortion Coefficients</h3>
-          <pre>{JSON.stringify(distCoeffs, null, 2)}</pre>
+      {/* bottom bar */}
+      {!calibrating && (
+        <div style={{
+          position: "absolute", bottom: 0, left: 0, right: 0,
+          height: 120,
+          background: "rgba(0,0,0,0.4)",
+          backdropFilter: "blur(16px)",
+          WebkitBackdropFilter: "blur(16px)",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          paddingBottom: 12,
+        }}>
+          <button onClick={handleButton} style={{
+            width: 68, height: 68,
+            borderRadius: "50%",
+            border: recording ? "3px solid rgba(220,50,50,0.6)" : "3px solid rgba(255,255,255,0.5)",
+            background: recording ? "rgba(220,50,50,0.3)" : "rgba(255,255,255,0.95)",
+            cursor: "pointer", outline: "none",
+            boxShadow: recording ? "0 0 0 6px rgba(220,50,50,0.2)" : "none",
+            transition: "all 0.15s",
+          }} />
         </div>
       )}
     </div>
   );
 }
+
+const pill = {
+  fontFamily: "monospace", fontSize: 12,
+  color: "rgba(255,255,255,0.8)",
+  background: "rgba(0,0,0,0.4)",
+  padding: "2px 8px", borderRadius: 999,
+};

@@ -1,6 +1,4 @@
-import asyncio
-import base64
-import io
+import json
 import time
 
 import cv2
@@ -8,46 +6,84 @@ import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+from calibrate import Calibrator
+
 app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+calibrator = Calibrator()
+
 
 @app.websocket("/ws")
-async def ws(websocket: WebSocket):
+async def ws_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("client connected")
+
     try:
         while True:
-            # receive compressed JPEG bytes
-            data = await websocket.receive_bytes()
-            t0 = time.perf_counter()
+            msg = await websocket.receive()
 
-            # decode
-            buf   = np.frombuffer(data, dtype=np.uint8)
-            frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+            # ── binary: JPEG frame with 4-byte frame_id header ────────────────
+            if "bytes" in msg and msg["bytes"]:
+                data = msg["bytes"]
+                t0   = time.perf_counter()
 
-            if frame is not None:
-                h, w = frame.shape[:2]
-                # draw red square in center
-                sq = min(w, h) // 4
-                cx, cy = w // 2, h // 2
-                cv2.rectangle(
-                    frame,
-                    (cx - sq, cy - sq),
-                    (cx + sq, cy + sq),
-                    (0, 0, 255),  # BGR red
-                    3,
+                # parse header
+                frame_id = int.from_bytes(data[:4], "big")
+                jpeg     = data[4:]
+
+                buf   = np.frombuffer(jpeg, dtype=np.uint8)
+                frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+
+                if frame is None:
+                    continue
+
+                _, found, corners = calibrator.process_frame_bgr(frame)
+
+                ms = (time.perf_counter() - t0) * 1000
+                print(
+                    f"{'FOUND' if found else 'no board'} | "
+                    f"{ms:.1f}ms | in={len(jpeg)//1024}KB | "
+                    f"frames={calibrator.frame_count()}"
                 )
 
-                # re-encode at same small size
-                _, enc = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
-                out = enc.tobytes()
-            else:
-                out = data  # pass through on error
+                # send back coords only — tiny JSON
+                await websocket.send_text(json.dumps({
+                    "type":     "status",
+                    "frame_id": frame_id,
+                    "frames":   calibrator.frame_count(),
+                    "found":    found,
+                    "corners":  corners,  # [[x,y], ...] in SEND_WIDTH x SEND_HEIGHT space or null
+                }))
 
-            elapsed_ms = (time.perf_counter() - t0) * 1000
-            print(f"processed in {elapsed_ms:.1f}ms  {len(data)/1024:.1f}KB → {len(out)/1024:.1f}KB")
+            # ── text: JSON command ────────────────────────────────────────────
+            elif "text" in msg and msg["text"]:
+                cmd    = json.loads(msg["text"])
+                action = cmd.get("action")
 
-            await websocket.send_bytes(out)
+                if action == "calibrate":
+                    try:
+                        result = calibrator.calibrate()
+                        await websocket.send_text(json.dumps({
+                            "type": "calibration_result",
+                            "data": result,
+                        }))
+                        print(f"calibrated — RMS: {result['rms_reprojection_error']:.4f}")
+                    except RuntimeError as e:
+                        await websocket.send_text(json.dumps({
+                            "type":    "error",
+                            "message": str(e),
+                        }))
+
+                elif action == "reset":
+                    calibrator.reset()
+                    await websocket.send_text(json.dumps({"type": "reset"}))
+                    print("reset")
 
     except WebSocketDisconnect:
         print("client disconnected")

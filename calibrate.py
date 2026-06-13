@@ -1,150 +1,114 @@
+import json
+
 import cv2
 import numpy as np
 
-# ==========================
-# SETTINGS
-# ==========================
+CHESSBOARD_SIZE = (8, 5)   # inner corners (cols, rows)
+SQUARE_SIZE_MM  = 10.0
 
-CAMERA_INDEX = 0
 
-# If your physical board has 9 x 6 squares, inner corners are 8 x 5
-CHESSBOARD_SIZE = (8, 5)
+class Calibrator:
+    def __init__(self):
+        self.objpoints  = []
+        self.imgpoints  = []
+        self.image_size = None
+        self.last_found = False
+        self._subpix_crit = (
+            cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001
+        )
 
-# If your board has 9 x 6 INNER CORNERS, use this instead:
-# CHESSBOARD_SIZE = (9, 6)
+        objp = np.zeros(
+            (CHESSBOARD_SIZE[0] * CHESSBOARD_SIZE[1], 3), np.float32
+        )
+        objp[:, :2] = (
+            np.mgrid[0:CHESSBOARD_SIZE[0], 0:CHESSBOARD_SIZE[1]]
+            .T.reshape(-1, 2)
+        )
+        objp *= SQUARE_SIZE_MM
+        self._objp = objp
 
-SQUARE_SIZE_MM = 10
-NUM_CAPTURES_NEEDED = 20
+    def process_frame_bgr(self, bgr: np.ndarray):
+        """
+        Detect chessboard. Saves frame if found.
+        Returns (bgr, found, corners_list_or_None)
+        corners_list: [[x,y], ...] in full-res pixel coords
+        """
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        self.image_size = (bgr.shape[1], bgr.shape[0])
 
-# ==========================
-# OBJECT POINTS
-# ==========================
-
-objp = np.zeros((CHESSBOARD_SIZE[0] * CHESSBOARD_SIZE[1], 3), np.float32)
-objp[:, :2] = np.mgrid[
-    0:CHESSBOARD_SIZE[0],
-    0:CHESSBOARD_SIZE[1]
-].T.reshape(-1, 2)
-objp *= SQUARE_SIZE_MM
-
-object_points = []
-image_points = []
-
-criteria = (
-    cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
-    30,
-    0.001
-)
-
-cap = cv2.VideoCapture(CAMERA_INDEX)
-
-if not cap.isOpened():
-    raise RuntimeError("Could not open camera.")
-
-print("Press SPACE to save a detected chessboard frame.")
-print("Press C to calibrate once enough frames are saved.")
-print("Press Q to quit.")
-
-last_gray = None
-
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("Could not read frame.")
-        break
-
-    display = frame.copy()
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    last_gray = gray
-
-    found, corners = cv2.findChessboardCorners(gray, CHESSBOARD_SIZE, None)
-
-    if found:
-        refined_corners = cv2.cornerSubPix(
+        found, corners = cv2.findChessboardCorners(
             gray,
-            corners,
-            (11, 11),
-            (-1, -1),
-            criteria
+            CHESSBOARD_SIZE,
+            cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE,
         )
 
-        cv2.drawChessboardCorners(display, CHESSBOARD_SIZE, refined_corners, found)
+        corners_out = None
+        if found:
+            corners = cv2.cornerSubPix(
+                gray, corners, (11, 11), (-1, -1), self._subpix_crit
+            )
+            self.objpoints.append(self._objp.copy())
+            self.imgpoints.append(corners)
+            corners_out = corners.reshape(-1, 2).tolist()
 
-        cv2.putText(
-            display,
-            "Chessboard detected - press SPACE to capture",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 255, 0),
-            2
-        )
-    else:
-        refined_corners = None
-        cv2.putText(
-            display,
-            "No chessboard detected",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 0, 255),
-            2
-        )
+        self.last_found = bool(found)
+        return bgr, bool(found), corners_out
 
-    cv2.putText(
-        display,
-        f"Captured: {len(object_points)}/{NUM_CAPTURES_NEEDED}",
-        (20, 80),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        (255, 255, 255),
-        2
-    )
+    def frame_count(self):
+        return len(self.objpoints)
 
-    cv2.imshow("Live Chessboard Calibration", display)
+    def reset(self):
+        self.objpoints  = []
+        self.imgpoints  = []
+        self.image_size = None
+        self.last_found = False
 
-    key = cv2.waitKey(1) & 0xFF
+    def calibrate(self):
+        n = len(self.objpoints)
+        if n < 5:
+            raise RuntimeError(f"Need at least 5 valid frames, have {n}")
 
-    if key == ord("q"):
-        break
-
-    elif key == ord(" ") and found:
-        object_points.append(objp.copy())
-        image_points.append(refined_corners.copy())
-        print(f"Captured frame {len(object_points)}")
-
-    elif key == ord("c"):
-        if len(object_points) < 10:
-            print("Need at least 10 good captures before calibration.")
-            continue
-
-        ret, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.calibrateCamera(
-            object_points,
-            image_points,
-            last_gray.shape[::-1],
+        rms, K, D, rvecs, tvecs = cv2.calibrateCamera(
+            self.objpoints,
+            self.imgpoints,
+            self.image_size,
             None,
-            None
+            None,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-6),
         )
 
-        print("\nCalibration complete.")
-        print("Reprojection error:", ret)
+        result = {
+            "rms_reprojection_error": float(rms),
+            "camera_matrix": {
+                "fx": float(K[0, 0]),
+                "fy": float(K[1, 1]),
+                "cx": float(K[0, 2]),
+                "cy": float(K[1, 2]),
+            },
+            "camera_matrix_3x3": K.tolist(),
+            "dist_coeffs": {
+                "k1": float(D[0, 0]),
+                "k2": float(D[0, 1]),
+                "p1": float(D[0, 2]),
+                "p2": float(D[0, 3]),
+                "k3": float(D[0, 4]) if D.shape[1] > 4 else 0.0,
+            },
+            "dist_coeffs_array": D.flatten().tolist(),
+            "image_size": {
+                "width":  int(self.image_size[0]),
+                "height": int(self.image_size[1]),
+            },
+            "num_frames": n,
+        }
 
-        print("\nCamera Matrix:")
-        print(camera_matrix)
-
-        print("\nDistortion Coefficients:")
-        print(dist_coeffs)
-
+        # also save locally on the server
+        with open("intrinsics.json", "w") as f:
+            json.dump(result, f, indent=2)
         np.savez(
-            "camera_calibration.npz",
-            camera_matrix=camera_matrix,
-            dist_coeffs=dist_coeffs,
-            rvecs=rvecs,
-            tvecs=tvecs
+            "intrinsics.npz",
+            camera_matrix=K,
+            dist_coeffs=D,
         )
+        print("saved intrinsics.json and intrinsics.npz")
 
-        print("\nSaved to camera_calibration.npz")
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+        return result
