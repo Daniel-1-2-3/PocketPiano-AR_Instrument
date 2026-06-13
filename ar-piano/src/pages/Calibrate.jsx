@@ -5,9 +5,6 @@ const WS_URL      = "ws://172.20.10.4:8000/ws";
 const SEND_WIDTH  = 320;
 const SEND_HEIGHT = 240;
 const JPEG_Q      = 0.6;
-const FRAME_BUFFER_SIZE = 30; // hold last N frames
-const BOARD_COLS  = 8;
-const BOARD_ROWS  = 5;
 
 export default function Calibrate() {
   const webcamRef    = useRef(null);
@@ -18,9 +15,6 @@ export default function Calibrate() {
   const sendTimeRef  = useRef(0);
   const rafRef       = useRef(null);
   const recordingRef = useRef(false);
-  const frameIdRef   = useRef(0);
-  // ring buffer: id → ImageData of that frame
-  const frameBufferRef = useRef(new Map());
 
   const [connected,   setConnected]   = useState(false);
   const [recording,   setRecording]   = useState(false);
@@ -54,57 +48,45 @@ export default function Calibrate() {
         const msg = JSON.parse(e.data);
 
         if (msg.type === "status") {
-          setFrames(msg.frames);
+          setFrames(msg.found ? frames + 1 : frames);
 
-          const canvas  = overlayRef.current;
-          if (!canvas) return;
+          const canvas = overlayRef.current;
+          const webcam = webcamRef.current;
+          if (!canvas || !webcam?.video) return;
+          const video = webcam.video;
+          const rect  = video.getBoundingClientRect();
+          canvas.width  = Math.round(rect.width);
+          canvas.height = Math.round(rect.height);
 
-          // get the frame this response corresponds to
-          const buf     = frameBufferRef.current;
-          const stored  = buf.get(msg.frame_id);
+          const sx = canvas.width  / SEND_WIDTH;
+          const sy = canvas.height / SEND_HEIGHT;
 
-          const W = canvas.width  = SEND_WIDTH;
-          const H = canvas.height = SEND_HEIGHT;
           const ctx = canvas.getContext("2d");
-          ctx.clearRect(0, 0, W, H);
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-          // draw the original frame first
-          if (stored) {
-            ctx.putImageData(stored, 0, 0);
-            buf.delete(msg.frame_id);
-          }
+          if (msg.found && msg.bbox && msg.marker) {
+            const { x1, y1, x2, y2 } = msg.bbox;
 
-          // draw corners on top if found
-          if (msg.found && msg.corners) {
-            const pts = msg.corners;
+            // bounding box
             ctx.strokeStyle = "#00ff50";
-            ctx.lineWidth   = 1.5;
-            // rows
-            for (let r = 0; r < BOARD_ROWS; r++) {
-              ctx.beginPath();
-              for (let c = 0; c < BOARD_COLS; c++) {
-                const [x, y] = pts[r * BOARD_COLS + c];
-                c === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-              }
-              ctx.stroke();
-            }
-            // cols
-            for (let c = 0; c < BOARD_COLS; c++) {
-              ctx.beginPath();
-              for (let r = 0; r < BOARD_ROWS; r++) {
-                const [x, y] = pts[r * BOARD_COLS + c];
-                r === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-              }
-              ctx.stroke();
-            }
-            // dots
+            ctx.lineWidth   = 2;
+            ctx.strokeRect(x1 * sx, y1 * sy, (x2 - x1) * sx, (y2 - y1) * sy);
+
+            // corner dots
             ctx.fillStyle = "#00ff50";
-            for (const [x, y] of pts) {
+            for (const [x, y] of msg.marker.corners) {
               ctx.beginPath();
-              ctx.arc(x, y, 2.5, 0, Math.PI * 2);
+              ctx.arc(x * sx, y * sy, 4, 0, Math.PI * 2);
               ctx.fill();
             }
+
+            // marker id label
+            ctx.font      = "bold 14px monospace";
+            ctx.fillStyle = "#00ff50";
+            ctx.fillText(`id:${msg.marker.id}`, x1 * sx, y1 * sy - 6);
           }
+
+          waitingRef.current = false;
         }
 
         if (msg.type === "calibration_result") {
@@ -163,33 +145,13 @@ export default function Calibrate() {
 
       offCtx.drawImage(video, 0, 0, SEND_WIDTH, SEND_HEIGHT);
 
-      // snapshot this frame's pixels before sending
-      const frameId  = frameIdRef.current++;
-      const imgData  = offCtx.getImageData(0, 0, SEND_WIDTH, SEND_HEIGHT);
-
-      // keep buffer bounded
-      const buf = frameBufferRef.current;
-      buf.set(frameId, imgData);
-      if (buf.size > FRAME_BUFFER_SIZE) {
-        const oldest = buf.keys().next().value;
-        buf.delete(oldest);
-      }
-
       off.toBlob((blob) => {
         if (!blob) return;
         blob.arrayBuffer().then((rawBuf) => {
           if (ws.readyState !== WebSocket.OPEN) return;
-
-          // prepend 4-byte frame_id header so server echoes it back
-          const header  = new ArrayBuffer(4);
-          new DataView(header).setUint32(0, frameId, false);
-          const payload = new Uint8Array(4 + rawBuf.byteLength);
-          payload.set(new Uint8Array(header), 0);
-          payload.set(new Uint8Array(rawBuf), 4);
-
           sendTimeRef.current = performance.now();
           waitingRef.current  = true;
-          ws.send(payload.buffer);
+          ws.send(rawBuf);
         });
       }, "image/jpeg", JPEG_Q);
     };
@@ -207,7 +169,6 @@ export default function Calibrate() {
       wsRef.current?.send(JSON.stringify({ action: "calibrate" }));
     } else {
       wsRef.current?.send(JSON.stringify({ action: "reset" }));
-      frameBufferRef.current.clear();
       recordingRef.current = true;
       setRecording(true);
     }

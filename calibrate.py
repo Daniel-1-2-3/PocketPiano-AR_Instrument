@@ -3,112 +3,44 @@ import json
 import cv2
 import numpy as np
 
-CHESSBOARD_SIZE = (8, 5)   # inner corners (cols, rows)
-SQUARE_SIZE_MM  = 10.0
+ARUCO_DICT    = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+ARUCO_PARAMS  = cv2.aruco.DetectorParameters()
+DETECTOR      = cv2.aruco.ArucoDetector(ARUCO_DICT, ARUCO_PARAMS)
 
 
 class Calibrator:
     def __init__(self):
-        self.objpoints  = []
-        self.imgpoints  = []
-        self.image_size = None
-        self.last_found = False
-        self._subpix_crit = (
-            cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001
-        )
-
-        objp = np.zeros(
-            (CHESSBOARD_SIZE[0] * CHESSBOARD_SIZE[1], 3), np.float32
-        )
-        objp[:, :2] = (
-            np.mgrid[0:CHESSBOARD_SIZE[0], 0:CHESSBOARD_SIZE[1]]
-            .T.reshape(-1, 2)
-        )
-        objp *= SQUARE_SIZE_MM
-        self._objp = objp
+        self.detections = []  # list of detected corner arrays for future use
 
     def process_frame_bgr(self, bgr: np.ndarray):
         """
-        Detect chessboard. Saves frame if found.
-        Returns (bgr, found, corners_list_or_None)
-        corners_list: [[x,y], ...] in full-res pixel coords
+        Detect ArUco tag. Returns (bgr, found, bbox_or_None)
+        bbox: {x, y, w, h} bounding box in pixel coords of the input frame
+        also returns corners: [[x,y], ...] of the 4 tag corners
         """
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        self.image_size = (bgr.shape[1], bgr.shape[0])
 
-        found, corners = cv2.findChessboardCorners(
-            gray,
-            CHESSBOARD_SIZE,
-            cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE,
-        )
+        corners, ids, _ = DETECTOR.detectMarkers(gray)
 
-        corners_out = None
-        if found:
-            corners = cv2.cornerSubPix(
-                gray, corners, (11, 11), (-1, -1), self._subpix_crit
-            )
-            self.objpoints.append(self._objp.copy())
-            self.imgpoints.append(corners)
-            corners_out = corners.reshape(-1, 2).tolist()
+        if ids is None or len(ids) == 0:
+            return bgr, False, None, None
 
-        self.last_found = bool(found)
-        return bgr, bool(found), corners_out
+        # use first detected marker
+        c      = corners[0].reshape(4, 2)
+        x1     = float(c[:, 0].min())
+        y1     = float(c[:, 1].min())
+        x2     = float(c[:, 0].max())
+        y2     = float(c[:, 1].max())
+        bbox   = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+        pts    = c.tolist()  # [[x,y], [x,y], [x,y], [x,y]] TL TR BR BL
+        marker_id = int(ids[0][0])
+
+        self.detections.append({"corners": pts, "id": marker_id})
+
+        return bgr, True, bbox, {"corners": pts, "id": marker_id}
 
     def frame_count(self):
-        return len(self.objpoints)
+        return len(self.detections)
 
     def reset(self):
-        self.objpoints  = []
-        self.imgpoints  = []
-        self.image_size = None
-        self.last_found = False
-
-    def calibrate(self):
-        n = len(self.objpoints)
-        if n < 5:
-            raise RuntimeError(f"Need at least 5 valid frames, have {n}")
-
-        rms, K, D, rvecs, tvecs = cv2.calibrateCamera(
-            self.objpoints,
-            self.imgpoints,
-            self.image_size,
-            None,
-            None,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-6),
-        )
-
-        result = {
-            "rms_reprojection_error": float(rms),
-            "camera_matrix": {
-                "fx": float(K[0, 0]),
-                "fy": float(K[1, 1]),
-                "cx": float(K[0, 2]),
-                "cy": float(K[1, 2]),
-            },
-            "camera_matrix_3x3": K.tolist(),
-            "dist_coeffs": {
-                "k1": float(D[0, 0]),
-                "k2": float(D[0, 1]),
-                "p1": float(D[0, 2]),
-                "p2": float(D[0, 3]),
-                "k3": float(D[0, 4]) if D.shape[1] > 4 else 0.0,
-            },
-            "dist_coeffs_array": D.flatten().tolist(),
-            "image_size": {
-                "width":  int(self.image_size[0]),
-                "height": int(self.image_size[1]),
-            },
-            "num_frames": n,
-        }
-
-        # also save locally on the server
-        with open("intrinsics.json", "w") as f:
-            json.dump(result, f, indent=2)
-        np.savez(
-            "intrinsics.npz",
-            camera_matrix=K,
-            dist_coeffs=D,
-        )
-        print("saved intrinsics.json and intrinsics.npz")
-
-        return result
+        self.detections = []
