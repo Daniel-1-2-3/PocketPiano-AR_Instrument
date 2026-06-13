@@ -78,8 +78,12 @@ class Renderer:
         self.dist = DIST.copy()
 
     def update_intrinsics(self, result: dict):
-        self.K    = np.array(result["camera_matrix"],     dtype=np.float64)
-        self.dist = np.array(result["dist_coefficients"], dtype=np.float64)
+        # Keys here MUST match what calibrate.py writes into its result dict:
+        #   camera_matrix_3x3  -> full 3x3 K
+        #   dist_coeffs_array  -> flat [k1, k2, p1, p2, k3]
+        self.K    = np.array(result["camera_matrix_3x3"], dtype=np.float64)
+        self.dist = np.array(result["dist_coeffs_array"], dtype=np.float64).reshape(-1, 1)
+        print(f"intrinsics updated: fx={self.K[0,0]:.1f} fy={self.K[1,1]:.1f}")
 
     def process_frame_bgr(self, bgr: np.ndarray):
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
