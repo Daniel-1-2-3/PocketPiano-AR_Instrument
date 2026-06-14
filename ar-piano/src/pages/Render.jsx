@@ -7,7 +7,7 @@ import {
 } from "./keyboardLayout";
 
 // ── paste your ngrok URL here each session ────────────────────────────────────
-const WS_URL = "wss://7255-2620-101-f000-7c2-00-39e.ngrok-free.app/ws";
+const WS_URL = "wss://272e-2620-101-f000-7c2-00-1-3d9e.ngrok-free.app/ws";
 
 // 16:9 at 240p — matches phone camera ratio so the server decodes undistorted
 const SEND_WIDTH  = 426;
@@ -37,6 +37,13 @@ const TUT_STEP_MS       = 1300;
 const TUT_HIT_WINDOW_MS = 1000;
 const TUT_FEEDBACK_MS   = 700;
 const TUT_LIFT_FRAC     = 0.55;
+
+// ── FSR velocity / dynamics ───────────────────────────────────────────────────
+// The server normalises each FSR's analog reading to 0..1 (msg.fsr_levels), as a
+// short peak-hold so it survives the sparse network frame rate. That maps to how
+// loud the struck note is: VEL_FLOOR for a feather-light tap up to 1.0 for a hard
+// press. Raise VEL_FLOOR if soft presses come out too quiet.
+const VEL_FLOOR = 0.28;
 
 // Twinkle Twinkle Little Star (white-key letters, ascends within one octave)
 const MELODY = [
@@ -327,9 +334,10 @@ export default function Render() {
 
           // PLAY RULE: a key sounds only when the SAME finger is inside the key
           // region AND its FSR registers a tap. This is the ONLY source of sound.
-          const fingers = msg.fingers || {};
-          const fsr     = msg.fsr || {};
-          const nowKey  = {};
+          const fingers   = msg.fingers || {};
+          const fsr       = msg.fsr || {};
+          const fsrLevels = msg.fsr_levels || {};   // 0..1 press hardness per finger
+          const nowKey    = {};
 
           for (const name of ALL_FINGERS) {
             const tip = fingers[name];
@@ -348,7 +356,14 @@ export default function Render() {
           for (const name of ALL_FINGERS) {
             const now  = nowKey[name];
             const prev = pressedRef.current[name] ?? null;
-            if (now !== null && now !== prev) playFreq(freqForKey(now));
+            // edge-triggered note-on. Velocity = how hard the FSR is pressed
+            // (msg.fsr_levels, 0..1) mapped to a loudness floor..1.0, so a light
+            // tap is still audible and a hard press is louder.
+            if (now !== null && now !== prev) {
+              const lvl      = Math.max(0, Math.min(1, fsrLevels[name] ?? 0));
+              const velocity = VEL_FLOOR + (1 - VEL_FLOOR) * lvl;
+              playFreq(freqForKey(now), velocity);
+            }
             pressedRef.current[name] = now;
           }
         }

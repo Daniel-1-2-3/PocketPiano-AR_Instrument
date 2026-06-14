@@ -144,13 +144,18 @@ async def ws_endpoint(websocket: WebSocket):
             # ── normal detection frame ──
             result = await detect_async(data, loop)
 
-            # FSR snapshot is cheap + thread-safe — read it here, not in a worker
+            # FSR snapshot is cheap + thread-safe — read it here, not in a worker.
+            #   fsr        : booleans, the note-ON taps (finger pressed or not)
+            #   fsr_levels : 0..1 press hardness per finger, used by the frontend
+            #                as note VELOCITY so the sound varies with how hard
+            #                you press (dynamics).
             result["fsr"]           = fsr.states()
+            result["fsr_levels"]    = fsr.levels()
             result["fsr_connected"] = fsr.connected_status()
 
             # Overlap detection / key events are computed CLIENT-SIDE, where the
             # keyboard geometry (homography + key layout) lives. We send the raw
-            # ingredients (fingertips + fsr) and leave keyEvents empty here.
+            # ingredients (fingertips + fsr + fsr_levels) and leave keyEvents empty.
             result["keyEvents"] = []
 
             await websocket.send_text(json.dumps({"type": "status", **result}))
