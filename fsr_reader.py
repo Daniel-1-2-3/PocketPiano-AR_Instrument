@@ -28,7 +28,11 @@ FINGER_NAMES = ["thumb", "index", "middle", "ring", "pinky"]
 # ── SET YOUR PORTS HERE ──────────────────────────────────────────────────────
 #   Windows:  "COM9"   Mac/Linux: "/dev/ttyACM0" or "/dev/ttyUSB0"
 #   Set a port to None to disable that hand.
-LEFT_PORT  = "COM9"
+#
+# Only the right glove is connected. Left disabled (left_* will read False).
+# Make sure RIGHT_PORT matches the port your one Arduino enumerates as — watch
+# the "[fsr] available serial ports:" line at startup to confirm.
+LEFT_PORT  = None
 RIGHT_PORT = "COM10"
 
 # analog reading above this counts as a "tap" — tune to your FSRs

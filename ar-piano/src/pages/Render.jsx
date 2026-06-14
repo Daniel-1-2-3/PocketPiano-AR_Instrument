@@ -7,7 +7,7 @@ import {
 } from "./keyboardLayout";
 
 // ── paste your ngrok URL here each session ────────────────────────────────────
-const WS_URL = "wss://479d-2620-101-f000-7c2-00-39e.ngrok-free.app/ws";
+const WS_URL = "wss://4a78-2620-101-f000-7c2-00-39e.ngrok-free.app/ws";
 
 // 16:9 at 240p — matches phone camera ratio so the server decodes undistorted
 const SEND_WIDTH  = 426;
@@ -30,10 +30,11 @@ const HAND_CONNECTIONS = [
 ];
 const FINGERTIP_IDS = { 4:"thumb", 8:"index", 12:"middle", 16:"ring", 20:"pinky" };
 
+// Only the right hand is used / in frame. Tracker forces every detected hand to
+// "right", so we only ever look at right_* fingers here.
 const ALL_FINGERS = [];
-for (const hand of ["left","right"])
-  for (const f of ["thumb","index","middle","ring","pinky"])
-    ALL_FINGERS.push(`${hand}_${f}`);
+for (const f of ["thumb","index","middle","ring","pinky"])
+  ALL_FINGERS.push(`right_${f}`);
 
 // Heckbert unit-square → quad homography (maps tag-plane (u,v) → image).
 function makeHomography(p0, p1, p2, p3) {
@@ -253,11 +254,10 @@ export default function Render() {
 
       // ── debug readout: confirms hand tracking + FSR wiring at a glance ──────
       // Drawn on the canvas (not React state) so it costs nothing extra per
-      // frame and doesn't trigger re-renders.
+      // frame and doesn't trigger re-renders. Right hand only now.
       {
-        const fc  = msg?.fsr_connected || { left: false, right: false };
-        const txt = `hands: ${(msg?.hands || []).length}  |  `
-                  + `FSR  L:${fc.left ? "✓" : "✗"}  R:${fc.right ? "✓" : "✗"}`;
+        const fc  = msg?.fsr_connected || { right: false };
+        const txt = `hands: ${(msg?.hands || []).length}  |  FSR R:${fc.right ? "✓" : "✗"}`;
         ctx.font = "12px monospace";
         ctx.textAlign = "right";
         ctx.textBaseline = "top";
@@ -289,7 +289,7 @@ export default function Render() {
           ctx.beginPath(); ctx.arc(pts[i][0],pts[i][1],2.5,0,Math.PI*2);
           ctx.fillStyle = "rgba(255,255,255,0.95)"; ctx.fill();
         }
-        // fingertip dots + debug labels (left_index, ...)
+        // fingertip dots + debug labels (right_index, ...)
         const handLabel = hand.hand || "?";
         for (const id in FINGERTIP_IDS) {
           const p = pts[id];

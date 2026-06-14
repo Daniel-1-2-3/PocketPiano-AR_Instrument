@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import Webcam from "react-webcam";
 
 // ── paste your ngrok URL here each session ────────────────────────────────────
-const WS_URL = "wss://479d-2620-101-f000-7c2-00-39e.ngrok-free.app/ws";
+const WS_URL = "wss://4a78-2620-101-f000-7c2-00-39e.ngrok-free.app/ws";
 
 const VIDEO_MIME = "video/webm;codecs=vp8";
 const VIDEO_BPS  = 1_000_000;

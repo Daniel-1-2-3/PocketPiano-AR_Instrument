@@ -31,9 +31,16 @@ from mediapipe.tasks.python import vision
 _THIS_DIR  = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(_THIS_DIR, "hand_landmarker.task")
 
+# Only the right hand is ever used / in frame. With one hand, MediaPipe's
+# left/right guess is unreliable (top-down, non-mirrored, gloves), so we just
+# force the single detected hand to "right" — matching the FSR keys (right_*)
+# and the frontend. SWAP_LEFT_RIGHT is irrelevant while this is True.
+ONLY_RIGHT_HAND = True
+
 # If MediaPipe reports left/right swapped (common with a NON-mirrored rear
 # camera looking down), flip this. It must match how your gloves are wired,
 # because the FSR mapping keys off "left"/"right".
+# (Ignored while ONLY_RIGHT_HAND is True.)
 SWAP_LEFT_RIGHT = False
 
 # exponential smoothing for fingertip pixels (1.0 = none, lower = smoother)
@@ -73,7 +80,7 @@ class HandTracker:
         opts = HandLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=model_path),
             running_mode=RunningMode.VIDEO,   # VIDEO mode = temporal tracking
-            num_hands=2,
+            num_hands=1 if ONLY_RIGHT_HAND else 2,
             min_hand_detection_confidence=MIN_DETECTION_CONF,
             min_hand_presence_confidence=MIN_PRESENCE_CONF,
             min_tracking_confidence=MIN_TRACKING_CONF,
@@ -83,6 +90,8 @@ class HandTracker:
         self._smooth = {}   # finger_key -> (x, y)
 
     def _label(self, name):
+        if ONLY_RIGHT_HAND:
+            return "right"
         if name is None:
             return "unknown"
         n = name.lower()
@@ -123,6 +132,8 @@ class HandTracker:
                 cat   = res.handedness[i][0]
                 label = self._label(cat.category_name)
                 score = float(cat.score)
+            else:
+                label = self._label(None)   # still forced to "right" if ONLY_RIGHT_HAND
 
             # ── full 21-point skeleton in pixels ──
             landmarks = [{
