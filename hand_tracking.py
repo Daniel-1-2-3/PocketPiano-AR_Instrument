@@ -1,337 +1,156 @@
-import os
+# hand_tracking.py
+# ─────────────────────────────────────────────────────────────────────────────
+# Thin wrapper around the MediaPipe Tasks HandLandmarker. Keeps all MediaPipe
+# setup out of server.py.
+#
+# tracker.process(frame_bgr) returns (hands, fingers):
+#   hands   = [ { "hand": "left"/"right", "score": float,
+#                 "landmarks": [ {id, x_px, y_px, z}, ... 21 points ] }, ... ]
+#   fingers = { "left_index": {hand, finger, finger_index, x_px, y_px}, ... }
+#
+# The fingertip names (left_index, right_thumb, ...) are exactly the keys the
+# FSR reader uses, so the two line up with no extra mapping.
+
 import cv2
 import numpy as np
+import mediapipe as mp
+import os
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
+# Put hand_landmarker.task next to THIS FILE.
+#   download: https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
+#
+# IMPORTANT: resolved relative to this file's own directory, NOT the current
+# working directory. A bare "hand_landmarker.task" only worked if uvicorn
+# happened to be launched from this exact folder — if it was launched from
+# anywhere else, HandLandmarker.create_from_options() throws, server.py
+# catches it and sets tracker = None, and EVERY frame after that silently
+# returns 0 hands no matter what's in view. Check the startup console for
+# "[hands] disabled: ..." — that's this failure.
+_THIS_DIR  = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(_THIS_DIR, "hand_landmarker.task")
 
-try:
-    import mediapipe as mp
-    from mediapipe.tasks import python
-    from mediapipe.tasks.python import vision
+# If MediaPipe reports left/right swapped (common with a NON-mirrored rear
+# camera looking down), flip this. It must match how your gloves are wired,
+# because the FSR mapping keys off "left"/"right".
+SWAP_LEFT_RIGHT = False
 
-    MEDIAPIPE_AVAILABLE = True
+# exponential smoothing for fingertip pixels (1.0 = none, lower = smoother)
+SMOOTHING = 0.5
 
-except Exception as error:
-    print(f"MediaPipe import failed: {error}")
-    MEDIAPIPE_AVAILABLE = False
-    mp = None
-    python = None
-    vision = None
+# Detection thresholds. 0.55 is fairly strict — top-down views, gloves, or
+# motion blur can all push confidence below this and result in 0 hands even
+# when a hand is clearly in frame. Lowered to 0.3 as a starting point; raise
+# back toward 0.5+ once you confirm detection works, to cut false positives.
+MIN_DETECTION_CONF = 0.3
+MIN_PRESENCE_CONF  = 0.3
+MIN_TRACKING_CONF  = 0.3
 
+# Print one line every N frames: frame size/brightness + raw landmark count.
+# This tells you definitively whether process() runs and what MediaPipe sees.
+# Set to 0 to disable.
+DEBUG_EVERY_N_FRAMES = 30
 
-FINGERTIPS = {
-    "thumb": 4,
-    "index": 8,
-    "middle": 12,
-    "ring": 16,
-    "pinky": 20,
-}
-
+# the 5 fingertip landmark ids in MediaPipe's 21-point hand model
+FINGERTIPS   = {"thumb": 4, "index": 8, "middle": 12, "ring": 16, "pinky": 20}
 FINGER_ORDER = ["thumb", "index", "middle", "ring", "pinky"]
+
+BaseOptions           = python.BaseOptions
+HandLandmarker        = vision.HandLandmarker
+HandLandmarkerOptions = vision.HandLandmarkerOptions
+RunningMode           = vision.RunningMode
 
 
 class HandTracker:
-    """
-    MediaPipe Tasks hand tracker.
-
-    Output:
-    {
-      hands: [
-        {
-          hand: "left",
-          score: 0.95,
-          landmarks: [
-            { id, x_px, y_px, z },
-            ...
-          ]
-        }
-      ],
-      fingers: {
-        left_index: {
-          hand,
-          finger,
-          x_px,
-          y_px,
-          x_cm,
-          y_cm
-        }
-      }
-    }
-
-    x_cm/y_cm are ArUco-local only when marker corners are available.
-    """
-
-    def __init__(
-        self,
-        model_path="hand_landmarker.task",
-        tag_size_cm=5.0,
-        smoothing=0.45,
-        swap_left_right=False,
-        x_sign=1,
-    ):
-        self.model_path = model_path
-        self.tag_size_cm = tag_size_cm
-        self.smoothing = smoothing
-        self.swap_left_right = swap_left_right
-        self.x_sign = x_sign
-
-        self.frame_counter = 0
-        self.landmarker = None
-
-        # Smooth only fingertip positions, not the full skeleton.
-        self.smoothed_tip_px = {}
-
-        if not MEDIAPIPE_AVAILABLE:
-            print("MediaPipe unavailable. Hand tracking disabled.")
-            return
-
+    def __init__(self, model_path: str = MODEL_PATH):
         if not os.path.exists(model_path):
-            print(
-                f"MediaPipe model not found: {model_path}. "
-                "Hand tracking disabled until you add hand_landmarker.task."
+            raise FileNotFoundError(
+                f"hand_landmarker.task not found at: {model_path}\n"
+                f"  -> download it and place it next to hand_tracking.py:\n"
+                f"     https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
             )
-            return
-
-        BaseOptions = python.BaseOptions
-        HandLandmarker = vision.HandLandmarker
-        HandLandmarkerOptions = vision.HandLandmarkerOptions
-        VisionRunningMode = vision.RunningMode
-
-        options = HandLandmarkerOptions(
+        opts = HandLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=model_path),
-            running_mode=VisionRunningMode.VIDEO,
+            running_mode=RunningMode.VIDEO,   # VIDEO mode = temporal tracking
             num_hands=2,
-            min_hand_detection_confidence=0.55,
-            min_hand_presence_confidence=0.55,
-            min_tracking_confidence=0.55,
+            min_hand_detection_confidence=MIN_DETECTION_CONF,
+            min_hand_presence_confidence=MIN_PRESENCE_CONF,
+            min_tracking_confidence=MIN_TRACKING_CONF,
         )
+        self.landmarker = HandLandmarker.create_from_options(opts)
+        self._frame = 0
+        self._smooth = {}   # finger_key -> (x, y)
 
-        self.landmarker = HandLandmarker.create_from_options(options)
-
-        print("MediaPipe hand tracker loaded.")
-
-    def normalize_hand_label(self, label):
-        """
-        MediaPipe returns 'Left' or 'Right'.
-        For a rear phone camera looking down at a table, usually this is okay.
-
-        If it feels reversed, set SWAP_LEFT_RIGHT=True in server.py.
-        """
-        if label is None:
+    def _label(self, name):
+        if name is None:
             return "unknown"
+        n = name.lower()
+        if SWAP_LEFT_RIGHT:
+            if n == "left":  return "right"
+            if n == "right": return "left"
+        return n
 
-        label = label.lower()
-
-        if self.swap_left_right:
-            if label == "left":
-                return "right"
-            if label == "right":
-                return "left"
-
-        return label
-
-    def marker_basis(self, marker):
-        """
-        Converts marker corners into a local coordinate basis.
-
-        ArUco corner order:
-        [top-left, top-right, bottom-right, bottom-left]
-
-        x axis: tag left → tag right
-        y axis: tag top → tag bottom
-
-        This lets each fingertip get x_cm/y_cm relative to the marker.
-        """
-        if not marker:
-            return None
-
-        corners = marker.get("corners")
-
-        if corners is None:
-            return None
-
-        pts = np.array(corners, dtype=np.float32).reshape(4, 2)
-
-        tl, tr, br, bl = pts
-
-        center = np.mean(pts, axis=0)
-
-        x_axis = ((tr - tl) + (br - bl)) / 2.0
-        y_axis = ((bl - tl) + (br - tr)) / 2.0
-
-        x_norm = np.linalg.norm(x_axis)
-        y_norm = np.linalg.norm(y_axis)
-
-        if x_norm <= 1 or y_norm <= 1:
-            return None
-
-        x_unit = x_axis / x_norm
-        y_unit = y_axis / y_norm
-
-        cm_per_px = marker.get("cm_per_px")
-
-        if cm_per_px is None:
-            side_lengths = [
-                np.linalg.norm(tr - tl),
-                np.linalg.norm(br - tr),
-                np.linalg.norm(bl - br),
-                np.linalg.norm(tl - bl),
-            ]
-
-            avg_side_px = float(np.mean(side_lengths))
-
-            if avg_side_px <= 1:
-                return None
-
-            cm_per_px = self.tag_size_cm / avg_side_px
-
-        return {
-            "center": center,
-            "x_unit": x_unit,
-            "y_unit": y_unit,
-            "cm_per_px": float(cm_per_px),
-        }
-
-    def local_cm_from_px(self, x_px, y_px, basis):
-        """
-        Projects a fingertip pixel onto the ArUco tag's local x/y axes.
-        """
-        if basis is None:
-            return None, None
-
-        point = np.array([x_px, y_px], dtype=np.float32)
-        offset = point - basis["center"]
-
-        x_px_local = float(np.dot(offset, basis["x_unit"]))
-        y_px_local = float(np.dot(offset, basis["y_unit"]))
-
-        x_cm = self.x_sign * x_px_local * basis["cm_per_px"]
-        y_cm = y_px_local * basis["cm_per_px"]
-
-        return x_cm, y_cm
-
-    def smooth_tip(self, finger_key, x_px, y_px):
-        previous = self.smoothed_tip_px.get(finger_key)
-
-        if previous is None:
-            smoothed = (x_px, y_px)
-        else:
-            old_x, old_y = previous
-
-            smoothed = (
-                self.smoothing * x_px + (1.0 - self.smoothing) * old_x,
-                self.smoothing * y_px + (1.0 - self.smoothing) * old_y,
-            )
-
-        self.smoothed_tip_px[finger_key] = smoothed
-        return smoothed
-
-    def detect(self, frame_bgr, marker=None):
-        if self.landmarker is None:
-            return {
-                "hands": [],
-                "fingers": {},
-            }
-
+    def process(self, frame_bgr):
         h, w = frame_bgr.shape[:2]
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        # VIDEO mode requires a monotonically increasing timestamp (ms)
+        self._frame += 1
+        ts_ms = self._frame * 33
+        res = self.landmarker.detect_for_video(mp_img, ts_ms)
 
-        mp_image = mp.Image(
-            image_format=mp.ImageFormat.SRGB,
-            data=frame_rgb,
-        )
+        # ── DIAGNOSTIC: proves process() runs every frame and shows exactly
+        # what MediaPipe returns. If "process() called" never prints, the
+        # tracker isn't being invoked at all (check server.py wiring). If it
+        # prints but raw_hands=0 forever with a visible hand and reasonable
+        # brightness, it's a detection-quality issue (angle/lighting/gloves),
+        # not a wiring issue.
+        if DEBUG_EVERY_N_FRAMES and self._frame % DEBUG_EVERY_N_FRAMES == 0:
+            brightness = float(rgb.mean())
+            print(f"[hands] process() called | frame={w}x{h} "
+                  f"brightness={brightness:.1f} | raw_hands={len(res.hand_landmarks)}")
 
-        # VIDEO mode requires a strictly increasing timestamp.
-        self.frame_counter += 1
-        timestamp_ms = self.frame_counter * 33
+        hands, fingers = [], {}
+        if not res.hand_landmarks:
+            return hands, fingers
 
-        result = self.landmarker.detect_for_video(
-            mp_image,
-            timestamp_ms,
-        )
+        for i, lms in enumerate(res.hand_landmarks):
+            # ── handedness label + score ──
+            label, score = "unknown", None
+            if res.handedness and i < len(res.handedness) and res.handedness[i]:
+                cat   = res.handedness[i][0]
+                label = self._label(cat.category_name)
+                score = float(cat.score)
 
-        if not result.hand_landmarks:
-            return {
-                "hands": [],
-                "fingers": {},
-            }
+            # ── full 21-point skeleton in pixels ──
+            landmarks = [{
+                "id":   j,
+                "x_px": float(lm.x * w),
+                "y_px": float(lm.y * h),
+                "z":    float(lm.z),
+            } for j, lm in enumerate(lms)]
+            hands.append({"hand": label, "score": score, "landmarks": landmarks})
 
-        basis = self.marker_basis(marker)
-
-        hands_out = []
-        fingers_out = {}
-
-        for hand_index, hand_landmarks in enumerate(result.hand_landmarks):
-            hand_label = f"hand_{hand_index + 1}"
-            hand_score = None
-
-            # Handedness classification: left or right.
-            if result.handedness and hand_index < len(result.handedness):
-                if len(result.handedness[hand_index]) > 0:
-                    category = result.handedness[hand_index][0]
-                    hand_label = self.normalize_hand_label(category.category_name)
-                    hand_score = float(category.score)
-
-            landmarks_out = []
-
-            for landmark_id, lm in enumerate(hand_landmarks):
-                x_px = float(lm.x * w)
-                y_px = float(lm.y * h)
-
-                landmarks_out.append({
-                    "id": int(landmark_id),
-                    "x_px": round(x_px, 2),
-                    "y_px": round(y_px, 2),
-                    "z": round(float(lm.z), 5),
-                })
-
-            hands_out.append({
-                "hand": hand_label,
-                "score": round(hand_score, 3) if hand_score is not None else None,
-                "landmarks": landmarks_out,
-            })
-
-            # Extract fingertips only.
-            for finger_name, landmark_id in FINGERTIPS.items():
-                lm = hand_landmarks[landmark_id]
-
-                raw_x_px = float(lm.x * w)
-                raw_y_px = float(lm.y * h)
-
-                finger_key = f"{hand_label}_{finger_name}"
-
-                smooth_x_px, smooth_y_px = self.smooth_tip(
-                    finger_key,
-                    raw_x_px,
-                    raw_y_px,
-                )
-
-                x_cm, y_cm = self.local_cm_from_px(
-                    smooth_x_px,
-                    smooth_y_px,
-                    basis,
-                )
-
-                fingers_out[finger_key] = {
-                    "hand": hand_label,
-                    "hand_score": round(hand_score, 3) if hand_score is not None else None,
-                    "finger": finger_name,
-                    "finger_index": FINGER_ORDER.index(finger_name),
-
-                    # Smoothed position used by frontend for hit detection.
-                    "x_px": round(smooth_x_px, 2),
-                    "y_px": round(smooth_y_px, 2),
-
-                    # Raw MediaPipe fingertip position for debugging.
-                    "raw_x_px": round(raw_x_px, 2),
-                    "raw_y_px": round(raw_y_px, 2),
-
-                    # ArUco-local coordinates. Null when marker is not found.
-                    "x_cm": round(x_cm, 2) if x_cm is not None else None,
-                    "y_cm": round(y_cm, 2) if y_cm is not None else None,
+            # ── named fingertips (smoothed) ──
+            for fname, lid in FINGERTIPS.items():
+                lm = lms[lid]
+                x, y = float(lm.x * w), float(lm.y * h)
+                key  = f"{label}_{fname}"
+                prev = self._smooth.get(key)
+                if prev is None:
+                    sx, sy = x, y
+                else:
+                    sx = SMOOTHING * x + (1.0 - SMOOTHING) * prev[0]
+                    sy = SMOOTHING * y + (1.0 - SMOOTHING) * prev[1]
+                self._smooth[key] = (sx, sy)
+                fingers[key] = {
+                    "hand":         label,
+                    "finger":       fname,
+                    "finger_index": FINGER_ORDER.index(fname),
+                    "x_px":         round(sx, 1),
+                    "y_px":         round(sy, 1),
                 }
 
-        return {
-            "hands": hands_out,
-            "fingers": fingers_out,
-        }
+        return hands, fingers
