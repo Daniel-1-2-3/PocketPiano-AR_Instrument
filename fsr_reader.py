@@ -33,7 +33,7 @@ FINGER_NAMES = ["thumb", "index", "middle", "ring", "pinky"]
 # Make sure RIGHT_PORT matches the port your one Arduino enumerates as — watch
 # the "[fsr] available serial ports:" line at startup to confirm.
 LEFT_PORT  = None
-RIGHT_PORT = "COM10"
+RIGHT_PORT = "COM5"
 
 # analog reading above this counts as a "tap" — tune to your FSRs
 TAP_THRESHOLD = 300

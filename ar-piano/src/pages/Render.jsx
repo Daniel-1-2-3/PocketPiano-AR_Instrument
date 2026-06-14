@@ -7,7 +7,7 @@ import {
 } from "./keyboardLayout";
 
 // ── paste your ngrok URL here each session ────────────────────────────────────
-const WS_URL = "wss://4a78-2620-101-f000-7c2-00-39e.ngrok-free.app/ws";
+const WS_URL = "wss://bfa4-2620-101-f000-7c2-00-39e.ngrok-free.app/ws";
 
 // 16:9 at 240p — matches phone camera ratio so the server decodes undistorted
 const SEND_WIDTH  = 426;
